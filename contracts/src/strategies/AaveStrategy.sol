@@ -1,5 +1,5 @@
 //SPDX-License-Identifier: MIT
-pragma solidity ^0.8.24;
+pragma solidity ^0.8.28;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -14,14 +14,27 @@ import {AaveAdapter} from "../adapters/AaveAdapter.sol";
  * @title AaveStrategy
  * @notice Strategy that lends assets on Aave V3 to generate yield
  * @dev This strategy uses the AaveAdapter to interact with Aave protocol
+ * @dev Uses namespaced storage for upgrade safety
  */
 contract AaveStrategy is Initializable, IStrategy, OwnableUpgradeable, UUPSUpgradeable {
     using SafeERC20 for IERC20;
 
-    IERC20 public override asset;
-    AaveAdapter public adapter;
-    address public override vault;
-    string public override name;
+    /// @custom:storage-location erc7201:aave.strategy.storage
+    struct AaveStrategyStorage {
+        IERC20 asset;
+        AaveAdapter adapter;
+        address vault;
+        string name;
+    }
+
+    // keccak256(abi.encode(uint256(keccak256("aave.strategy.storage")) - 1)) & ~bytes32(uint256(0xff))
+    bytes32 private constant AAVE_STRATEGY_STORAGE_LOCATION = 0x52c63247e1f47db19d5ce0460030c497f067ca4cebf71ba98eeadabe20bace00;
+
+    function _getAaveStrategyStorage() private pure returns (AaveStrategyStorage storage $) {
+        assembly {
+            $.slot := AAVE_STRATEGY_STORAGE_LOCATION
+        }
+    }
 
     uint256 private constant RAY = 1e27;
     uint256 private constant SECONDS_PER_YEAR = 365 days;
@@ -29,21 +42,23 @@ contract AaveStrategy is Initializable, IStrategy, OwnableUpgradeable, UUPSUpgra
     error AaveStrategy_OnlyVault();
     error AaveStrategy_VaultAlreadySet();
     error AaveStrategy_ZeroAmount();
+    error AaveStrategy_AssetNotRegistered();
     error AaveStrategy_ZeroAddress();
+    error AaveStrategy_DepositFailed();
 
     event VaultSet(address indexed vault);
     event Deposited(uint256 amount);
     event Withdrawn(uint256 amount, address indexed recipient);
 
     modifier onlyVault() {
-        if (msg.sender != vault) revert AaveStrategy_OnlyVault();
+        AaveStrategyStorage storage $ = _getAaveStrategyStorage();
+        if (msg.sender != $.vault) revert AaveStrategy_OnlyVault();
         _;
     }
 
     constructor() {
         _disableInitializers();
     }
-
 
     function initialize(
         address _asset,
@@ -56,35 +71,40 @@ contract AaveStrategy is Initializable, IStrategy, OwnableUpgradeable, UUPSUpgra
         if (_asset == address(0)) revert AaveStrategy_ZeroAddress();
         if (_adapter == address(0)) revert AaveStrategy_ZeroAddress();
 
-        asset = IERC20(_asset);
-        adapter = AaveAdapter(_adapter);
-        name = _name;
+        AaveStrategyStorage storage $ = _getAaveStrategyStorage();
+        $.asset = IERC20(_asset);
+        $.adapter = AaveAdapter(_adapter);
+        $.name = _name;
 
         // Approve adapter to spend our assets for deposits
-        asset.forceApprove(address(adapter), type(uint256).max);
+        $.asset.forceApprove(address($.adapter), type(uint256).max);
 
         // Approve adapter to spend our aTokens for withdrawals
         // Note: We'll need to do this after the adapter registers the asset
         // This will be handled in setVault or we can add a separate function
     }
 
-    function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
+    function version() public pure virtual returns (string memory) {
+        return "1.0.0";
+    }
 
+    function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
 
     /**
      * @notice Sets the vault address (can only be called once)
      * @param _vault The vault address
      */
     function setVault(address _vault) external onlyOwner {
-        if (vault != address(0)) revert AaveStrategy_VaultAlreadySet();
+        AaveStrategyStorage storage $ = _getAaveStrategyStorage();
+        if ($.vault != address(0)) revert AaveStrategy_VaultAlreadySet();
         if (_vault == address(0)) revert AaveStrategy_ZeroAddress();
         
-        vault = _vault;
+        $.vault = _vault;
         
         // Approve adapter to spend our aTokens for withdrawals
-        address aToken = adapter.getAToken(address(asset));
+        address aToken = $.adapter.getAToken(address($.asset));
         if (aToken != address(0)) {
-            IERC20(aToken).forceApprove(address(adapter), type(uint256).max);
+            IERC20(aToken).forceApprove(address($.adapter), type(uint256).max);
         }
         
         emit VaultSet(_vault);
@@ -95,7 +115,8 @@ contract AaveStrategy is Initializable, IStrategy, OwnableUpgradeable, UUPSUpgra
      * @return Total assets in the strategy (aToken balance)
      */
     function totalAssets() external view override returns (uint256) {
-        return adapter.getATokenBalance(address(asset), address(this));
+        AaveStrategyStorage storage $ = _getAaveStrategyStorage();
+        return $.adapter.getATokenBalance(address($.asset), address(this));
     }
 
     /**
@@ -106,11 +127,17 @@ contract AaveStrategy is Initializable, IStrategy, OwnableUpgradeable, UUPSUpgra
     function deposit(uint256 amount) external override onlyVault returns (uint256 actualAmount) {
         if (amount == 0) revert AaveStrategy_ZeroAmount();
         
+        AaveStrategyStorage storage $ = _getAaveStrategyStorage();
+        require($.adapter.isAssetRegistered(address($.asset)), AaveStrategy_AssetNotRegistered());
+        uint256 aTokenBefore = $.adapter.getATokenBalance(address($.asset), address(this));
         // Transfer assets from vault to this contract
-        asset.safeTransferFrom(msg.sender, address(this), amount);
+        $.asset.safeTransferFrom(msg.sender, address(this), amount);
         
         // Supply to Aave via adapter
-        actualAmount = adapter.supply(address(asset), amount, address(this));
+        actualAmount = $.adapter.supply(address($.asset), amount, address(this));
+
+        uint256 aTokenAfter = $.adapter.getATokenBalance(address($.asset), address(this));
+        require(aTokenAfter > aTokenBefore, AaveStrategy_DepositFailed());
         
         emit Deposited(actualAmount);
     }
@@ -130,8 +157,10 @@ contract AaveStrategy is Initializable, IStrategy, OwnableUpgradeable, UUPSUpgra
         if (amount == 0) revert AaveStrategy_ZeroAmount();
         if (recipient == address(0)) revert AaveStrategy_ZeroAddress();
         
+        AaveStrategyStorage storage $ = _getAaveStrategyStorage();
+        
         // Withdraw from Aave via adapter
-        actualAmount = adapter.withdraw(address(asset), amount, recipient);
+        actualAmount = $.adapter.withdraw(address($.asset), amount, recipient);
         
         emit Withdrawn(actualAmount, recipient);
     }
@@ -149,8 +178,10 @@ contract AaveStrategy is Initializable, IStrategy, OwnableUpgradeable, UUPSUpgra
     {
         if (recipient == address(0)) revert AaveStrategy_ZeroAddress();
         
+        AaveStrategyStorage storage $ = _getAaveStrategyStorage();
+        
         // Withdraw all from Aave via adapter
-        actualAmount = adapter.withdraw(address(asset), type(uint256).max, recipient);
+        actualAmount = $.adapter.withdraw(address($.asset), type(uint256).max, recipient);
         
         emit Withdrawn(actualAmount, recipient);
     }
@@ -160,7 +191,8 @@ contract AaveStrategy is Initializable, IStrategy, OwnableUpgradeable, UUPSUpgra
      * @return The APY in basis points (e.g., 500 = 5%)
      */
     function getAPY() external view override returns (uint256) {
-        uint256 liquidityRate = adapter.getSupplyAPY(address(asset));
+        AaveStrategyStorage storage $ = _getAaveStrategyStorage();
+        uint256 liquidityRate = $.adapter.getSupplyAPY(address($.asset));
         
         // Convert from ray (27 decimals) to basis points (4 decimals)
         // APY = (liquidityRate / RAY) * 10000
@@ -172,7 +204,8 @@ contract AaveStrategy is Initializable, IStrategy, OwnableUpgradeable, UUPSUpgra
      * @return The supply rate in ray (27 decimals)
      */
     function getSupplyRate() external view returns (uint256) {
-        return adapter.getSupplyAPY(address(asset));
+        AaveStrategyStorage storage $ = _getAaveStrategyStorage();
+        return $.adapter.getSupplyAPY(address($.asset));
     }
 
     /**
@@ -180,7 +213,8 @@ contract AaveStrategy is Initializable, IStrategy, OwnableUpgradeable, UUPSUpgra
      * @return The aToken balance
      */
     function getATokenBalance() external view returns (uint256) {
-        return adapter.getATokenBalance(address(asset), address(this));
+        AaveStrategyStorage storage $ = _getAaveStrategyStorage();
+        return $.adapter.getATokenBalance(address($.asset), address(this));
     }
 
     /**
@@ -188,7 +222,8 @@ contract AaveStrategy is Initializable, IStrategy, OwnableUpgradeable, UUPSUpgra
      * @return The aToken address
      */
     function getAToken() external view returns (address) {
-        return adapter.getAToken(address(asset));
+        AaveStrategyStorage storage $ = _getAaveStrategyStorage();
+        return $.adapter.getAToken(address($.asset));
     }
 
     /**
@@ -211,10 +246,32 @@ contract AaveStrategy is Initializable, IStrategy, OwnableUpgradeable, UUPSUpgra
         uint256 totalDeposited,
         uint256 currentAPY
     ) {
-        totalDeposited = adapter.getATokenBalance(address(asset), address(this));
+        AaveStrategyStorage storage $ = _getAaveStrategyStorage();
+        totalDeposited = $.adapter.getATokenBalance(address($.asset), address(this));
         currentAPY = this.getAPY();
         
         // Strategy is healthy if it has a positive APY and the adapter is working
-        isHealthy = currentAPY > 0 && adapter.isAssetRegistered(address(asset));
+        isHealthy = currentAPY > 0 && $.adapter.isAssetRegistered(address($.asset));
+    }
+
+    // Public getters for interface compatibility
+    function asset() external view override returns (IERC20) {
+        AaveStrategyStorage storage $ = _getAaveStrategyStorage();
+        return $.asset;
+    }
+
+    function vault() external view override returns (address) {
+        AaveStrategyStorage storage $ = _getAaveStrategyStorage();
+        return $.vault;
+    }
+
+    function name() external view override returns (string memory) {
+        AaveStrategyStorage storage $ = _getAaveStrategyStorage();
+        return $.name;
+    }
+
+    function adapter() external view returns (AaveAdapter) {
+        AaveStrategyStorage storage $ = _getAaveStrategyStorage();
+        return $.adapter;
     }
 } 
