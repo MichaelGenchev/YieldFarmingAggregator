@@ -3,7 +3,9 @@ pragma solidity ^0.8.24;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 
 import {IStrategy} from "../interfaces/IStrategy.sol";
 import {AaveAdapter} from "../adapters/AaveAdapter.sol";
@@ -13,11 +15,11 @@ import {AaveAdapter} from "../adapters/AaveAdapter.sol";
  * @notice Strategy that lends assets on Aave V3 to generate yield
  * @dev This strategy uses the AaveAdapter to interact with Aave protocol
  */
-contract AaveStrategy is IStrategy, Ownable {
+contract AaveStrategy is Initializable, IStrategy, OwnableUpgradeable, UUPSUpgradeable {
     using SafeERC20 for IERC20;
 
-    IERC20 public immutable override asset;
-    AaveAdapter public immutable adapter;
+    IERC20 public override asset;
+    AaveAdapter public adapter;
     address public override vault;
     string public override name;
 
@@ -38,25 +40,36 @@ contract AaveStrategy is IStrategy, Ownable {
         _;
     }
 
-    constructor(
+    constructor() {
+        _disableInitializers();
+    }
+
+
+    function initialize(
         address _asset,
         address _adapter,
         string memory _name
-    ) Ownable(msg.sender) {
+    ) external initializer {
+        __Ownable_init(msg.sender);
+        __UUPSUpgradeable_init();
+
         if (_asset == address(0)) revert AaveStrategy_ZeroAddress();
         if (_adapter == address(0)) revert AaveStrategy_ZeroAddress();
-        
+
         asset = IERC20(_asset);
         adapter = AaveAdapter(_adapter);
         name = _name;
-        
+
         // Approve adapter to spend our assets for deposits
         asset.forceApprove(address(adapter), type(uint256).max);
-        
+
         // Approve adapter to spend our aTokens for withdrawals
         // Note: We'll need to do this after the adapter registers the asset
         // This will be handled in setVault or we can add a separate function
     }
+
+    function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
+
 
     /**
      * @notice Sets the vault address (can only be called once)

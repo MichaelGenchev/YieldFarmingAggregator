@@ -3,6 +3,7 @@ pragma solidity ^0.8.24;
 
 import {Test, console2} from "forge-std/Test.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 
 import {StrategyVault} from "../src/StrategyVault.sol";
 import {AaveStrategy} from "../src/strategies/AaveStrategy.sol";
@@ -40,12 +41,26 @@ contract StrategyVaultTest is Test {
         // Register USDC with adapter
         adapter.registerAsset(USDC);
         
-        // Deploy strategy
-        strategy = new AaveStrategy(
+        // Deploy strategy using UUPS proxy pattern
+        // 1. Deploy implementation contract
+        AaveStrategy strategyImpl = new AaveStrategy();
+        
+        // 2. Encode the initialize function call
+        bytes memory initData = abi.encodeWithSelector(
+            AaveStrategy.initialize.selector,
             USDC,
             address(adapter),
             "Aave USDC Strategy"
         );
+        
+        // 3. Deploy proxy with initialize call
+        ERC1967Proxy strategyProxy = new ERC1967Proxy(
+            address(strategyImpl),
+            initData
+        );
+        
+        // 4. Cast proxy to AaveStrategy interface
+        strategy = AaveStrategy(address(strategyProxy));
         
         // Deploy vault
         vault = new StrategyVault(

@@ -6,6 +6,8 @@ import {StrategyVault} from "../src/StrategyVault.sol";
 import {AaveStrategy} from "../src/strategies/AaveStrategy.sol";
 import {AaveAdapter} from "../src/adapters/AaveAdapter.sol";
 
+import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+
 /**
  * @title DeployAaveVault
  * @notice Deployment script for the modular Aave vault system
@@ -38,10 +40,11 @@ contract DeployAaveVault is Script {
         
         // 3. Deploy AaveStrategy
         console.log("3. Deploying AaveStrategy...");
-        AaveStrategy strategy = new AaveStrategy(
-            USDC,
-            address(adapter),
-            "Aave USDC Strategy"
+        AaveStrategy strategy = AaveStrategy(
+            address(new ERC1967Proxy(
+                address(new AaveStrategy()),
+                abi.encodeWithSelector(AaveStrategy.initialize.selector, USDC, address(adapter), "Aave USDC Strategy")
+            ))
         );
         console.log("AaveStrategy deployed at:", address(strategy));
         
