@@ -1,13 +1,14 @@
 //SPDX-License-Identifier: MIT
 
-pragma solidity ^0.8.24;
+pragma solidity ^0.8.28;
 
 import {ERC4626} from "@openzeppelin/contracts/token/ERC20/extensions/ERC4626.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
-import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 import {IStrategy} from "./interfaces/IStrategy.sol";
 
@@ -16,9 +17,12 @@ import {IStrategy} from "./interfaces/IStrategy.sol";
  * @notice ERC-4626 compliant vault that delegates yield generation to strategy contracts
  * @dev This vault handles all accounting and can work with any strategy implementing IStrategy
  */
-contract StrategyVault is ERC4626, Ownable {
+contract StrategyVault is ERC4626, AccessControl, ReentrancyGuard {
     using SafeERC20 for IERC20;
     using Math for uint256;
+
+    bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
+
 
     IStrategy public strategy;
     bool public paused;
@@ -26,6 +30,10 @@ contract StrategyVault is ERC4626, Ownable {
     uint256 public withdrawalFee; // In basis points (100 = 1%)
     uint256 public managementFee; // In basis points (100 = 1% per year)
     uint256 public lastFeeCollection;
+    address public feeRecipient;
+    uint256 public accruedManagementFees;
+
+    mapping(address => bool) public approvedStrategies;
     
     uint256 private constant MAX_BPS = 10000;
     uint256 private constant SECONDS_PER_YEAR = 365 days;
@@ -37,6 +45,7 @@ contract StrategyVault is ERC4626, Ownable {
     error StrategyVault_InvalidFee();
     error StrategyVault_StrategyAlreadySet();
     error StrategyVault_NoStrategy();
+    error StrategyVault_StrategyNotApproved();
 
     event StrategySet(address indexed strategy);
     event Paused();
@@ -46,6 +55,7 @@ contract StrategyVault is ERC4626, Ownable {
     event ManagementFeeSet(uint256 fee);
     event FeesCollected(uint256 amount);
     event EmergencyWithdrawal(uint256 amount);
+    event FeeRecipientSet(address indexed feeRecipient);
 
     modifier whenNotPaused() {
         if (paused) revert StrategyVault_Paused();
@@ -62,7 +72,7 @@ contract StrategyVault is ERC4626, Ownable {
         string memory _name,
         string memory _symbol,
         address _strategy
-    ) ERC4626(IERC20(_asset)) ERC20(_name, _symbol) Ownable(msg.sender) {
+    ) ERC4626(IERC20(_asset)) ERC20(_name, _symbol) {
         if (_asset == address(0)) revert StrategyVault_ZeroAddress();
         
         if (_strategy != address(0)) {
@@ -72,6 +82,10 @@ contract StrategyVault is ERC4626, Ownable {
         
         depositLimit = type(uint256).max;
         lastFeeCollection = block.timestamp;
+        feeRecipient = msg.sender; // Default to deployer
+
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(PAUSER_ROLE, msg.sender);
         
         // Approve strategy to spend our assets
         if (_strategy != address(0)) {
@@ -83,7 +97,8 @@ contract StrategyVault is ERC4626, Ownable {
      * @notice Sets the strategy contract (can only be called once)
      * @param _strategy The strategy contract address
      */
-    function setStrategy(address _strategy) external onlyOwner {
+    function setStrategy(address _strategy) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (!approvedStrategies[_strategy]) revert StrategyVault_StrategyNotApproved();
         if (address(strategy) != address(0)) revert StrategyVault_StrategyAlreadySet();
         if (_strategy == address(0)) revert StrategyVault_ZeroAddress();
         
@@ -113,7 +128,7 @@ contract StrategyVault is ERC4626, Ownable {
         address receiver,
         uint256 assets,
         uint256 shares
-    ) internal override whenNotPaused hasStrategy {
+    ) internal override whenNotPaused hasStrategy nonReentrant {
         if (assets == 0) revert StrategyVault_ZeroAmount();
         if (totalAssets() + assets > depositLimit) revert StrategyVault_DepositLimitExceeded();
         
@@ -146,7 +161,7 @@ contract StrategyVault is ERC4626, Ownable {
         address owner,
         uint256 assets,
         uint256 shares
-    ) internal override whenNotPaused hasStrategy {
+    ) internal override whenNotPaused hasStrategy nonReentrant {
         if (assets == 0) revert StrategyVault_ZeroAmount();
         
         // Collect management fees before withdrawal
@@ -177,26 +192,26 @@ contract StrategyVault is ERC4626, Ownable {
      * @notice Collects management fees
      */
     function _collectManagementFees() internal {
-        if (managementFee == 0) return;
-        
+        if (managementFee == 0 || totalSupply() == 0) return;
         uint256 timePassed = block.timestamp - lastFeeCollection;
         if (timePassed == 0) return;
-        
-        uint256 totalShares = totalSupply();
-        if (totalShares == 0) return;
         
         // Calculate fee as a percentage of total assets per year
         uint256 feeAmount = (totalAssets() * managementFee * timePassed) / 
                            (MAX_BPS * SECONDS_PER_YEAR);
         
         if (feeAmount > 0) {
-            // Mint shares to owner as management fee
-            uint256 feeShares = _convertToShares(feeAmount, Math.Rounding.Floor);
-            _mint(owner(), feeShares);
+            accruedManagementFees += feeAmount;
             emit FeesCollected(feeAmount);
         }
         
         lastFeeCollection = block.timestamp;
+    }
+
+    function claimFees() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        uint256 amount = accruedManagementFees;
+        accruedManagementFees = 0;
+        IERC20(asset()).safeTransfer(feeRecipient, amount);
     }
 
     /**
@@ -209,7 +224,7 @@ contract StrategyVault is ERC4626, Ownable {
     /**
      * @notice Pause the vault
      */
-    function pause() external onlyOwner {
+    function pause() external onlyRole(PAUSER_ROLE) {
         paused = true;
         emit Paused();
     }
@@ -217,7 +232,7 @@ contract StrategyVault is ERC4626, Ownable {
     /**
      * @notice Unpause the vault
      */
-    function unpause() external onlyOwner {
+    function unpause() external onlyRole(PAUSER_ROLE) {
         paused = false;
         emit Unpaused();
     }
@@ -226,7 +241,7 @@ contract StrategyVault is ERC4626, Ownable {
      * @notice Set deposit limit
      * @param _limit The new deposit limit
      */
-    function setDepositLimit(uint256 _limit) external onlyOwner {
+    function setDepositLimit(uint256 _limit) external onlyRole(DEFAULT_ADMIN_ROLE) {
         depositLimit = _limit;
         emit DepositLimitSet(_limit);
     }
@@ -235,7 +250,7 @@ contract StrategyVault is ERC4626, Ownable {
      * @notice Set withdrawal fee
      * @param _fee The new withdrawal fee in basis points
      */
-    function setWithdrawalFee(uint256 _fee) external onlyOwner {
+    function setWithdrawalFee(uint256 _fee) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (_fee > 1000) revert StrategyVault_InvalidFee(); // Max 10%
         withdrawalFee = _fee;
         emit WithdrawalFeeSet(_fee);
@@ -245,7 +260,7 @@ contract StrategyVault is ERC4626, Ownable {
      * @notice Set management fee
      * @param _fee The new management fee in basis points per year
      */
-    function setManagementFee(uint256 _fee) external onlyOwner {
+    function setManagementFee(uint256 _fee) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (_fee > 1000) revert StrategyVault_InvalidFee(); // Max 10% per year
         
         // Collect existing fees before changing the rate
@@ -256,9 +271,19 @@ contract StrategyVault is ERC4626, Ownable {
     }
 
     /**
+     * @notice Set fee recipient
+     * @param _feeRecipient The new fee recipient address
+     */
+    function setFeeRecipient(address _feeRecipient) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (_feeRecipient == address(0)) revert StrategyVault_ZeroAddress();
+        feeRecipient = _feeRecipient;
+        emit FeeRecipientSet(_feeRecipient);
+    }
+
+    /**
      * @notice Emergency withdrawal of all funds from strategy
      */
-    function emergencyWithdraw() external onlyOwner {
+    function emergencyWithdraw() external onlyRole(DEFAULT_ADMIN_ROLE) {
         uint256 withdrawn = strategy.withdrawAll(address(this));
         emit EmergencyWithdrawal(withdrawn);
     }
@@ -352,7 +377,7 @@ contract StrategyVault is ERC4626, Ownable {
      * @param token The token to recover
      * @param amount The amount to recover
      */
-    function emergencyRecover(address token, uint256 amount) external onlyOwner {
-        IERC20(token).safeTransfer(owner(), amount);
+    function emergencyRecover(address token, uint256 amount) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        IERC20(token).safeTransfer(feeRecipient, amount);
     }
 }
