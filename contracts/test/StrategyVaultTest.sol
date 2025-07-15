@@ -4,7 +4,6 @@ pragma solidity ^0.8.28;
 import {Test, console2} from "forge-std/Test.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
-
 import {StrategyVault} from "../src/StrategyVault.sol";
 import {AaveStrategy} from "../src/strategies/AaveStrategy.sol";
 import {AaveAdapter} from "../src/adapters/AaveAdapter.sol";
@@ -103,6 +102,127 @@ contract StrategyVaultTest is Test {
         console2.log("Adapter deployed correctly");
         
         console2.log("=== DEPLOYMENT TEST COMPLETED ===");
+    }
+
+    function testInflationAttack() public {
+        // Test the classic inflation attack where:
+        // 1. Makes minimal deposit
+        // 2. Directly transfers assets to strategy
+        // 3. Tries to inflate share price to steal from subsequent depositors
+        console2.log("=== INFLATION ATTACK TEST ===");
+
+        address attacker = makeAddr("attacker");
+        address victim = makeAddr("victim");
+
+        deal(USDC, attacker, 10000e6);
+        deal(USDC, victim, 1000e6);
+
+        uint256 minimalDepositAmount = 1e6;
+
+        vm.startPrank(attacker);
+        asset.approve(address(vault), minimalDepositAmount);
+        uint256 attackerShares = vault.deposit(minimalDepositAmount, attacker);
+        vm.stopPrank();
+
+        console2.log("Attacker shares received:", attackerShares);
+        console2.log("Vault total assets after minimal deposit:", vault.totalAssets());
+        console2.log("Share price after minimal deposit:", vault.totalAssets() * 1e18 / vault.totalSupply());
+
+        uint256 donationAmount = 5000e6;
+        vm.prank(attacker);
+        asset.transfer(address(vault), donationAmount);
+
+        console2.log("Vault total assets after donation:", vault.totalAssets());
+        console2.log("Share price after donation:", vault.totalAssets() * 1e18 / vault.totalSupply());
+        
+
+        uint256 victimDeposit = 1000e6;
+        console2.log("Step 3: Victim deposits:", victimDeposit);
+
+        vm.startPrank(victim);
+        asset.approve(address(vault), victimDeposit);
+        uint256 victimShares = vault.deposit(victimDeposit, victim);
+        vm.stopPrank();
+
+        console2.log("Victim shares received:", victimShares);
+        console2.log("Vault total assets after victim deposit:", vault.totalAssets());
+        console2.log("Total shares outstanding:", vault.totalSupply());
+
+        // Calculate expected withdrawals
+        uint256 attackerExpectedWithdrawal = vault.previewRedeem(attackerShares);
+        uint256 victimExpectedWithdrawal = vault.previewRedeem(victimShares);
+
+        console2.log("Attacker expected withdrawal:", attackerExpectedWithdrawal);
+        console2.log("Victim expected withdrawal:", victimExpectedWithdrawal);
+
+        uint256 attackerTotalInput = minimalDepositAmount + donationAmount;
+        uint256 victimTotalInput = victimDeposit;
+
+        console2.log("Attacker total input:", attackerTotalInput);
+        console2.log("Victim total input:", victimTotalInput);
+
+        console2.log("=== Testing actual withdrawals ===");
+
+        vm.startPrank(attacker);
+        uint256 attackerActualWithdrawal = vault.redeem(attackerShares, attacker, attacker);
+        vm.stopPrank();
+        
+        vm.startPrank(victim);
+        uint256 victimActualWithdrawal = vault.redeem(victimShares, victim, victim);
+        vm.stopPrank();
+
+        console2.log("Attacker actual withdrawal:", attackerActualWithdrawal);
+        console2.log("Victim actual withdrawal:", victimActualWithdrawal);
+        
+        // Calculate profit/loss
+        int256 attackerProfitLoss = int256(attackerActualWithdrawal) - int256(attackerTotalInput);
+        int256 victimProfitLoss = int256(victimActualWithdrawal) - int256(victimTotalInput);
+        
+        console2.log("Attacker profit/loss:", attackerProfitLoss);
+        console2.log("Victim profit/loss:", victimProfitLoss);
+
+
+         // === PROTECTION VERIFICATION ===
+        
+        // The vault should be protected against inflation attacks
+        // Key protections to verify:
+        
+        // 1. Victim should not lose a significant portion of their deposit
+        // Allow for small rounding errors but victim should get most of their deposit back
+        uint256 victimLossPercentage = 0;
+        if (victimActualWithdrawal < victimTotalInput) {
+            victimLossPercentage = ((victimTotalInput - victimActualWithdrawal) * 10000) / victimTotalInput;
+        }
+        console2.log("Victim loss percentage (basis points):", victimLossPercentage);
+        
+        // Victim should not lose more than 1% due to the attack (allowing for fees and rounding)
+        assertLt(victimLossPercentage, 100, "Victim lost more than 1% - inflation attack succeeded!");
+        
+        // 2. Attacker should not profit significantly from the attack
+        // They might get some yield but shouldn't steal victim's funds
+        if (attackerProfitLoss > 0) {
+            uint256 attackerProfitPercentage = (uint256(attackerProfitLoss) * 10000) / attackerTotalInput;
+            console2.log("Attacker profit percentage (basis points):", attackerProfitPercentage);
+            
+            // Attacker shouldn't profit more than reasonable yield would provide
+            assertLt(attackerProfitPercentage, 50, "Attacker profited too much - inflation attack succeeded!");
+        }
+        
+        // 3. Total assets should be conserved (minus any fees)
+        uint256 totalInput = attackerTotalInput + victimTotalInput;
+        uint256 totalOutput = attackerActualWithdrawal + victimActualWithdrawal;
+        uint256 assetDifference = totalInput > totalOutput ? totalInput - totalOutput : totalOutput - totalInput;
+        uint256 conservationErrorPercentage = (assetDifference * 10000) / totalInput;
+        
+        console2.log("Total input:", totalInput);
+        console2.log("Total output:", totalOutput);
+        console2.log("Asset conservation error (basis points):", conservationErrorPercentage);
+        
+        // Allow for small fees and rounding errors
+        assertLt(conservationErrorPercentage, 50, "Assets not properly conserved!");
+        
+        console2.log("SUCCESS: Vault is protected against inflation attacks!");
+        console2.log("=== INFLATION ATTACK TEST COMPLETED ===");
     }
 
     function testSingleUserDepositWithdraw() public {
@@ -400,5 +520,146 @@ contract StrategyVaultTest is Test {
         console2.log("Strategy health information accurate");
         
         console2.log("=== STRATEGY HEALTH TEST COMPLETED ===");
+    }
+
+    function testZeroAmountDeposit() public {
+        vm.startPrank(user);
+        asset.approve(address(vault), 1000e6);
+        vm.expectRevert(StrategyVault.StrategyVault_ZeroAmount.selector);
+        vault.deposit(0, user);
+        vm.stopPrank();
+    }
+
+    function testZeroAddressDeposit() public {
+        vm.startPrank(user);
+        asset.approve(address(vault), 1000e6);
+        vm.expectRevert();
+        vault.deposit(1000e6, address(0));
+        vm.stopPrank();
+    }
+
+
+    function testUnauthorizedFunctionCalls() public {
+        vm.startPrank(user);
+        vm.expectRevert();
+        vault.setDepositLimit(1000e6);
+
+        vm.expectRevert();
+        vault.pause();
+
+        vm.expectRevert();
+        vault.emergencyWithdraw();
+
+        vm.stopPrank();
+    }
+
+
+    function testManagementFeeAccrual() public {
+        console2.log("=== MANAGEMENT FEE ACCRUAL TEST ===");
+        
+        // Set management fee
+        vm.prank(owner);
+        vault.setManagementFee(100); // 1% per year (100 basis points)
+        
+        uint256 depositAmount = 1000e6; // 1,000 USDC
+        console2.log("Deposit amount:", depositAmount);
+        console2.log("Management fee rate: 1% per year");
+        
+        vm.startPrank(user);
+        asset.approve(address(vault), depositAmount);
+        uint256 shares = vault.deposit(depositAmount, user);
+        vm.stopPrank();
+        
+        uint256 initialTotalAssets = vault.totalAssets();
+        uint256 initialAccruedFees = vault.getAccruedFeesAssetValue();
+        
+        console2.log("Initial total assets:", initialTotalAssets);
+        console2.log("Initial accrued fees:", initialAccruedFees);
+        console2.log("User shares:", shares);
+        
+        // Test 1: No fees should accrue immediately
+        assertEq(initialAccruedFees, 0, "Fees accrued immediately after deposit");
+        
+        // Test 2: Fast forward 6 months and check fees
+        console2.log("\n--- After 6 months ---");
+        vm.warp(block.timestamp + 182 days); // ~6 months
+        
+        vault.collectManagementFees();
+        
+        uint256 sixMonthAssets = vault.totalAssets();
+        uint256 sixMonthFees = vault.getAccruedFeesAssetValue();
+        
+        console2.log("Assets after 6 months:", sixMonthAssets);
+        console2.log("Accrued fees after 6 months:", sixMonthFees);
+        
+        // Should be approximately 0.5% of initial deposit (6 months of 1% annual fee)
+        uint256 expectedSixMonthFees = (depositAmount * 50) / 10000; // 0.5%
+        console2.log("Expected 6-month fees:", expectedSixMonthFees);
+        
+        assertGt(sixMonthFees, 0, "No fees accrued after 6 months");
+        assertApproxEqAbs(sixMonthFees, expectedSixMonthFees, expectedSixMonthFees / 10, "6-month fees not close to expected");
+        
+        // Test 3: Fast forward full year
+        console2.log("\n--- After 1 full year ---");
+        vm.warp(block.timestamp + 183 days); // Complete the year
+        
+        vault.collectManagementFees();
+        
+        uint256 yearAssets = vault.totalAssets();
+        uint256 yearFees = vault.getAccruedFeesAssetValue();
+        
+        console2.log("Assets after 1 year:", yearAssets);
+        console2.log("Accrued fees after 1 year:", yearFees);
+        
+        // Should be approximately 1% of initial deposit
+        uint256 expectedYearFees = (depositAmount * 100) / 10000; // 1%
+        console2.log("Expected 1-year fees:", expectedYearFees);
+        
+        assertApproxEqAbs(yearFees, expectedYearFees, expectedYearFees / 5, "1-year fees not close to expected");
+        
+        // Test 4: User should still be able to withdraw most of their deposit
+        console2.log("\n--- User withdrawal test ---");
+        
+        vm.prank(user);
+        uint256 userWithdrawal = vault.redeem(shares, user, user);
+        
+        console2.log("User withdrawal amount:", userWithdrawal);
+        
+        // Calculate user profit/loss (handle both cases)
+        if (userWithdrawal >= depositAmount) {
+            uint256 userProfit = userWithdrawal - depositAmount;
+            console2.log("User profit (including yield minus fees):", userProfit);
+        } else {
+            uint256 userLoss = depositAmount - userWithdrawal;
+            console2.log("User loss due to fees:", userLoss);
+        }
+        
+        // User should get back at least 98% of their deposit (allowing for fees + some yield)
+        uint256 minExpectedWithdrawal = (depositAmount * 98) / 100;
+        assertGt(userWithdrawal, minExpectedWithdrawal, "User lost more than 2% to management fees");
+        
+        // Test 5: Fee collection by admin
+        console2.log("\n--- Fee collection test ---");
+        
+        uint256 feeRecipientBalanceBefore = asset.balanceOf(vault.feeRecipient());
+        console2.log("Fee recipient balance before:", feeRecipientBalanceBefore);
+        
+        vm.prank(owner);
+        vault.claimFees();
+        
+        uint256 feeRecipientBalanceAfter = asset.balanceOf(vault.feeRecipient());
+        uint256 feesCollected = feeRecipientBalanceAfter - feeRecipientBalanceBefore;
+        
+        console2.log("Fee recipient balance after:", feeRecipientBalanceAfter);
+        console2.log("Fees collected:", feesCollected);
+        
+        assertGt(feesCollected, 0, "No fees were collected");
+        assertEq(vault.getAccruedFeesAssetValue(), 0, "Accrued fees not reset after collection");
+        
+        // Test 6: Verify fee collection was reasonable
+        assertApproxEqAbs(feesCollected, expectedYearFees, expectedYearFees / 5, "Collected fees don't match accrued fees");
+        
+        console2.log("SUCCESS: Management fees work correctly");
+        console2.log("=== MANAGEMENT FEE ACCRUAL TEST COMPLETED ===");
     }
 } 
