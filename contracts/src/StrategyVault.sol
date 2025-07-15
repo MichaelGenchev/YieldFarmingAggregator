@@ -113,7 +113,7 @@ contract StrategyVault is ERC4626, AccessControl, ReentrancyGuard {
      * @return Total assets in the vault (from strategy + any idle assets)
      */
     function totalAssets() public view override hasStrategy returns (uint256) {
-        return strategy.totalAssets() + IERC20(asset()).balanceOf(address(this));
+        return strategy.totalAssets();
     }
 
     /**
@@ -189,29 +189,56 @@ contract StrategyVault is ERC4626, AccessControl, ReentrancyGuard {
     }
 
     /**
-     * @notice Collects management fees
+     * @notice Collects management fees by minting shares to fee recipient
      */
     function _collectManagementFees() internal {
         if (managementFee == 0 || totalSupply() == 0) return;
         uint256 timePassed = block.timestamp - lastFeeCollection;
         if (timePassed == 0) return;
         
-        // Calculate fee as a percentage of total assets per year
-        uint256 feeAmount = (totalAssets() * managementFee * timePassed) / 
+        // Calculate fee as a percentage of total supply per year
+        // This mints new shares representing the fee percentage
+        uint256 feeShares = (totalSupply() * managementFee * timePassed) / 
                            (MAX_BPS * SECONDS_PER_YEAR);
         
-        if (feeAmount > 0) {
-            accruedManagementFees += feeAmount;
-            emit FeesCollected(feeAmount);
+        if (feeShares > 0) {
+            _mint(feeRecipient, feeShares);
+            accruedManagementFees += feeShares; // Track total fee shares
+            emit FeesCollected(feeShares);
         }
         
         lastFeeCollection = block.timestamp;
     }
 
     function claimFees() external onlyRole(DEFAULT_ADMIN_ROLE) {
-        uint256 amount = accruedManagementFees;
+        // Calculate the asset value of fee shares and redeem them
+        uint256 feeShares = accruedManagementFees;
+        if (feeShares == 0) return;
+        
+        // Convert fee shares to assets by redeeming them
+        uint256 feeAssets = previewRedeem(feeShares);
+        
+        // Transfer the shares from fee recipient to this contract temporarily
+        // then redeem them to get the underlying assets
+        _transfer(feeRecipient, address(this), feeShares);
+        
+        // Redeem the shares to get underlying assets
+        _burn(address(this), feeShares);
+        uint256 assetsToWithdraw = feeAssets;
+        
+        // Withdraw from strategy if needed
+        uint256 idleAssets = IERC20(asset()).balanceOf(address(this));
+        if (idleAssets < assetsToWithdraw) {
+            strategy.withdraw(assetsToWithdraw - idleAssets, address(this));
+        }
+        
+        // Transfer assets to fee recipient
+        IERC20(asset()).safeTransfer(feeRecipient, assetsToWithdraw);
+        
+        // Reset accrued fees
         accruedManagementFees = 0;
-        IERC20(asset()).safeTransfer(feeRecipient, amount);
+        
+        emit FeesCollected(assetsToWithdraw);
     }
 
     /**
@@ -370,6 +397,15 @@ contract StrategyVault is ERC4626, AccessControl, ReentrancyGuard {
         // Add withdrawal fee to the assets needed
         uint256 assetsWithFee = assets + ((assets * withdrawalFee) / MAX_BPS);
         return _convertToShares(assetsWithFee, Math.Rounding.Ceil);
+    }
+
+    /**
+     * @notice Get the asset value of accrued management fees
+     * @return The asset value of fee shares
+     */
+    function getAccruedFeesAssetValue() external view returns (uint256) {
+        if (accruedManagementFees == 0) return 0;
+        return previewRedeem(accruedManagementFees);
     }
 
     /**
