@@ -1,0 +1,54 @@
+# Ignore all config.yml files wherever they appear
+**/config.yml
+
+# Ignore all .env files (including .env.local, .env.production, etc.)
+*.env
+*.env.*
+
+# Go build outputs
+/bin/
+/build/
+/out/
+
+# Vendor directory (if you ever vendor dependencies)
+/vendor/
+
+# Go modules
+/go.sum
+
+# IDE/editor settings
+*.swp
+*~
+.vscode/
+.idea/
+*.iml
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+
+# Database files
+*.db
+*.sqlite
+
+# Coverage reports
+coverage.out
+*.coverprofile
+
+# Kubernetes/Docker overrides
+**/*.local.yml
+**/*.override.yml
+
+# TLS certificates
+*.crt
+*.key
+
+# Generated code (e.g., via mockery or swagger)
+/**/gen_*.go
